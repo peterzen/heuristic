@@ -27,6 +27,7 @@ commercial chain-analysis tools (Chainalysis, Elliptic, TRM), built on open data
 | **Address pages** | `/address/<addr>` | Balance, history, risk screening, exposure breakdown, source-of-funds provenance. |
 | **Screening API** | `/api/screen/<addr>` | Machine-readable JSON risk assessment. |
 | **Methodology** | `/methodology` | Exactly how each heuristic works and where it breaks. |
+| **Full trace (CLI)** | `npm run trace` | Runs the deep ancestry trace to completion against your own node — the whole thing, no clicking. |
 
 ### The analysis engine
 
@@ -54,10 +55,12 @@ npm run build        # production build
 npm run start        # serve the production build
 npm run lint
 npm run update-ofac  # refresh the bundled OFAC sanctions list
+npm run trace -- <address|txid>   # full ancestry trace against your own node
 ```
 
-Requires **Node 20+**. No API keys, no database, no environment variables needed
-to run against the public mempool.space API.
+Requires **Node 20+** — except `npm run trace`, which runs `lib/taint.ts`
+directly and needs **Node 22.18+**. No API keys, no database, no environment
+variables needed to run against the public mempool.space API.
 
 ---
 
@@ -84,6 +87,38 @@ Run [mempool/mempool](https://github.com/mempool/mempool) or
 [Blockstream/electrs](https://github.com/Blockstream/electrs) against any full
 Bitcoin node. (Your instance must allow CORS from the app's origin for in-browser
 direct mode.)
+
+---
+
+## Full trace from the command line
+
+A deep source-of-funds trace is thousands of transaction fetches. On the public
+API that is slow enough that `/check` runs it in short bursts and asks you to
+click **keep crawling** for each next one. Against your own node there is no such
+limit, so `scripts/trace-full.mjs` pumps that loop automatically until the
+frontier is exhausted — the same engine, the same labels, the same score, run to
+100% of value in one command:
+
+```bash
+npm run trace -- bc1qexample... --api http://your-node.local:3006/api
+npm run trace -- <txid> --json report.json          # machine-readable output
+npm run trace -- <addr> --save-state run.json       # checkpoint every round
+npm run trace -- --resume run.json                  # …and pick it back up
+```
+
+`npm run trace -- --help` lists every option. The useful ones:
+
+| Option | What it does |
+|---|---|
+| `--api <url>` | Esplora REST base. Defaults to `$ESPLORA_API_BASE`, else `http://127.0.0.1:3006/api`. |
+| `--min-fraction <f>` | Dust floor — branches holding less than this share of the coin aren't followed. Default `0.00001`, the engine's own `EPS`. Lower is more complete and much slower. |
+| `--max-nodes` / `--timeout` | Off-ramps. Combine with `--save-state` so a stop is resumable. |
+| `--deep` | Trace a labelled sender's own ancestry too (by default, as in the UI, a known entity's label *is* the origin). |
+| `--json <file>` | The full result — origins, fractions, score, band, graph — as JSON. `-` writes to stdout. |
+
+Exit code `0` means the trace completed, `2` means it stopped on a budget and is
+resumable. Pointed at a public endpoint it warns you and throttles itself; it is
+built for your own node.
 
 ---
 
@@ -147,7 +182,9 @@ lib/
   format.ts             number formatting (BTC/sats, no sci-notation, tabular)
   colors.ts             semantic colour tokens + risk ramp
 components/             canvas renderers + UI (Explorer, MempoolRain, Inspector, …)
-scripts/update-ofac.mjs refreshes lib/ofac.ts from the public OFAC mirror
+scripts/
+  update-ofac.mjs       refreshes lib/ofac.ts from the public OFAC mirror
+  trace-full.mjs        CLI: runs lib/taint.ts to 100% against your own node
 ```
 
 ---

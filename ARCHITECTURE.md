@@ -62,8 +62,34 @@ Key design decisions:
   red) and *mixing exposure* (coinjoin count → medium, scaling up). A coinjoin
   only goes red when its source is actually flagged. See `mixingRiskFor()`.
 
+### Value-weighted taint (the "check everything" engine)
+
+`lib/taint.ts` → `traceTaint(seedTxid, fetchTx, opts, resume?)` propagates the
+coin's value backward across the **whole** ancestor DAG (haircut taint), stopping
+a branch only at a definitive origin — a labelled entity, a coinbase, a coinjoin
+— or once its value share drops below `EPS`.
+
+The binding constraint is **fetch throughput, not compute**: every ancestor is a
+network round-trip. So the trace is **resumable** — it expands the highest-value
+frontier within a node/time budget, returns a serializable `TaintState`, and the
+next call picks up exactly where it stopped. That is what `/check`'s *keep
+crawling* button does, one budget at a time.
+
+`scripts/trace-full.mjs` drives that same loop to completion from the CLI
+(`npm run trace`), which is only practical against your own node — see the README.
+It imports `lib/taint.ts` directly rather than reimplementing anything, so a CLI
+result and a UI result cannot drift. Node runs the TypeScript natively (22.6+);
+a small `registerHooks` resolver in the script supplies the extension resolution
+Node's ESM loader doesn't do for `lib/*.ts`'s extensionless imports.
+
 ### Screening & provenance (the product layer)
 
+- `app/api/screen/[address]/route.ts` deliberately exposes only the **shallow**
+  screening (direct counterparties): one upstream call, cheap and cacheable. It
+  takes no depth/coverage parameter, because an endpoint that fans out to
+  thousands of upstream fetches per anonymous request is an abuse vector, not a
+  feature. Deep tracing lives in the UI (budgeted, user-driven) and in the CLI
+  (your own node, your own capacity).
 - `lib/screening.ts` → `buildScreening(address, txs, graph?)` — direct
   counterparty exposure + indirect ancestry exposure, aggregated by category
   into one acceptance-risk score. Pure function; reused by the UI **and** the
