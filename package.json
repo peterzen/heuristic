@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "update-ofac": "node scripts/update-ofac.mjs"
+    "update-ofac": "node scripts/update-ofac.mjs",
+    "trace": "node scripts/trace-full.mjs"
   },
   "dependencies": {
     "d3-force": "^3.0.0",

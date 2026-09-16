@@ -27,6 +27,7 @@ commercial chain-analysis tools (Chainalysis, Elliptic, TRM), built on open data
 | **Address pages** | `/address/<addr>` | Balance, history, risk screening, exposure breakdown, source-of-funds provenance. |
 | **Screening API** | `/api/screen/<addr>` | Machine-readable JSON risk assessment. |
 | **Methodology** | `/methodology` | Exactly how each heuristic works and where it breaks. |
+| **Full trace (CLI)** | `npm run trace` | Runs the deep ancestry trace to completion against your own node — the whole thing, no clicking. |
 
 ### The analysis engine
 
@@ -54,10 +55,12 @@ npm run build        # production build
 npm run start        # serve the production build
 npm run lint
 npm run update-ofac  # refresh the bundled OFAC sanctions list
+npm run trace -- <address|txid>   # full ancestry trace against your own node
 ```
 
-Requires **Node 20+**. No API keys, no database, no environment variables needed
-to run against the public mempool.space API.
+Requires **Node 20+** — except `npm run trace`, which runs `lib/taint.ts`
+directly and needs **Node 22.18+**. No API keys, no database, no environment
+variables needed to run against the public mempool.space API.
 
 ---
 
@@ -84,6 +87,114 @@ Run [mempool/mempool](https://github.com/mempool/mempool) or
 [Blockstream/electrs](https://github.com/Blockstream/electrs) against any full
 Bitcoin node. (Your instance must allow CORS from the app's origin for in-browser
 direct mode.)
+
+---
+
+## Full trace from the command line
+
+A deep source-of-funds trace is thousands of transaction fetches. On the public
+API that is slow enough that `/check` runs it in short bursts and asks you to
+click **keep crawling** for each next one. Against your own node there is no such
+limit, so `scripts/trace-full.mjs` pumps that loop automatically until the
+frontier is exhausted — the same engine, the same labels, the same score, run to
+100% of value in one command:
+
+```bash
+npm run trace -- bc1qexample... --api http://your-node.local:3006/api
+npm run trace -- <txid> --json report.json          # machine-readable output
+npm run trace -- <addr> --save-state run.json       # checkpoint every round
+npm run trace -- --resume run.json                  # …and pick it back up
+```
+
+`npm run trace -- --help` lists every option. The useful ones:
+
+| Option | What it does |
+|---|---|
+| `--api <url>` | Esplora REST base. Defaults to `$ESPLORA_API_BASE`, else `http://127.0.0.1:3006/api`. |
+| `--concurrency <n>` | Ceiling on parallel fetches (16 local, 8 remote). Backs off automatically when the node errors. |
+| `--min-fraction <f>` | Dust floor — branches holding less than this share of the coin aren't followed. Default `0.00001`, the engine's own `EPS`. Lower is more complete and much slower. |
+| `--max-nodes` / `--timeout` | Off-ramps. Combine with `--save-state` so a stop is resumable. |
+| `--deep` | Trace a labelled sender's own ancestry too (by default, as in the UI, a known entity's label *is* the origin). |
+| `--json <file>` | The full result — origins, fractions, score, band, graph — as JSON. `-` writes to stdout. |
+| `--log-failures <f>` | Every failed *and* retried request as JSONL, one object per attempt. |
+| `--request-timeout <sec>` | Give up on one request after this long. Default 10 local, 30 remote. |
+
+Exit code `0` means the trace completed and the result is usable, `2` means it is
+incomplete — it stopped on a budget (resumable via `--save-state`/`--resume`), or
+too little of the value resolved to rely on. A low score on a thin trace is
+reported as `UNVERIFIED`: "nothing found" is not "nothing there".
+
+Expect the **long tail** to dominate the runtime. The progress line reaches
+`>99%` early and then grinds for a long time: the last fraction of a percent is
+spread across thousands of small branches, each still a round-trip. The queued
+count next to it is the honest measure of what's left. The ancestor-tx counter
+tracks *distinct* transactions, so it can also sit still while the crawl
+re-expands ancestors it has already seen — neither is a stall.
+
+### When coverage comes back low
+
+Low coverage is almost always the endpoint, not the ancestry. Every run ends with
+the cause named:
+
+```
+  gaps     677 tx fetches failed — that value is counted as unresolved, not as clean
+           HTTP 500 Internal Server Error × 612 · UND_ERR_SOCKET × 51 · HTTP 404 × 14
+  upstream said:
+           HTTP 500 Internal Server Error → {"error":"Bitcoind RPC error: No such
+           mempool or blockchain transaction. Use -txindex or provide a block hash."}
+  retried  2,482 attempts · HTTP 500 Internal Server Error × 2,301
+```
+
+`upstream said` is the endpoint's own error body, one sample per distinct cause.
+It shows even when every request eventually succeeded, because a run that only
+*retried* heavily leaves no other trace — and on a 500 with nothing in your
+node's logs, that message is usually the whole diagnosis.
+
+A retry count in the thousands means requests are being rejected or dropped. On a
+public endpoint that is throttling. On your own node, look for `HTTP 500`
+or `UND_ERR_SOCKET` (it is buckling under load), `HTTP 404` (it does not have
+that history: still syncing, or pruned), or `TimeoutError` (requests wedging).
+
+**A local node is not automatically a fast one.** A mempool/Express backend is a
+single Node process in front of electrs; push enough parallel requests at it and
+it starts returning `{"error":"Failed to get transaction"}` for transactions it
+served correctly a second earlier. Against a node that fails above 8 in-flight
+requests, the difference is total:
+
+| `--concurrency` | coverage | retries | failed |
+|---|---|---|---|
+| 64 | **<0.1%** | 1,133 | 47 |
+| 8 | **99.6%** | 0 | 0 |
+
+So concurrency is a *ceiling*, not a setting: the crawl halves it on a round
+where more than 10% of requests error and eases back up on a clean one (AIMD, as
+TCP does it). Starting from a ceiling of 64 against that same node it settles on
+8 by itself and reaches 99.6%. When that happens the report says so:
+
+```
+  backoff  concurrency 64 → 8 — the node errored under load, so the crawl slowed itself down
+           start lower with --concurrency 8 to skip the failed rounds
+```
+
+`TimeoutError` is worth understanding, because the engine only checks its round
+budget *between* batches: one request that never answers holds up its whole batch
+of `--concurrency` fetches, and a 10-second round can run for minutes. If your
+rounds are taking far longer than `--round`, that is what is happening, and a
+tighter `--request-timeout` is the fix. `--log-failures <file>` writes every attempt as JSONL for
+digging further:
+
+```bash
+npm run trace -- <addr> --log-failures failures.jsonl
+jq -r .reason failures.jsonl | sort | uniq -c | sort -rn     # what failed
+jq -r 'select(.willRetry==false).path' failures.jsonl        # what was given up on
+```
+
+Each line carries `ts`, `path`, `attempt`, `status`, `reason`, `retryAfterSec`
+and `willRetry`, so a request that failed twice and then succeeded is
+distinguishable from one that was abandoned. The file is truncated per run.
+
+Pointed at a public endpoint it warns you and throttles itself; it is built for
+your own node.
 
 ---
 
@@ -147,7 +258,9 @@ lib/
   format.ts             number formatting (BTC/sats, no sci-notation, tabular)
   colors.ts             semantic colour tokens + risk ramp
 components/             canvas renderers + UI (Explorer, MempoolRain, Inspector, …)
-scripts/update-ofac.mjs refreshes lib/ofac.ts from the public OFAC mirror
+scripts/
+  update-ofac.mjs       refreshes lib/ofac.ts from the public OFAC mirror
+  trace-full.mjs        CLI: runs lib/taint.ts to 100% against your own node
 ```
 
 ---
