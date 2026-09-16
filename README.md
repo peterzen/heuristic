@@ -111,6 +111,7 @@ npm run trace -- --resume run.json                  # …and pick it back up
 | Option | What it does |
 |---|---|
 | `--api <url>` | Esplora REST base. Defaults to `$ESPLORA_API_BASE`, else `http://127.0.0.1:3006/api`. |
+| `--concurrency <n>` | Ceiling on parallel fetches (16 local, 8 remote). Backs off automatically when the node errors. |
 | `--min-fraction <f>` | Dust floor — branches holding less than this share of the coin aren't followed. Default `0.00001`, the engine's own `EPS`. Lower is more complete and much slower. |
 | `--max-nodes` / `--timeout` | Off-ramps. Combine with `--save-state` so a stop is resumable. |
 | `--deep` | Trace a labelled sender's own ancestry too (by default, as in the UI, a known entity's label *is* the origin). |
@@ -150,10 +151,30 @@ It shows even when every request eventually succeeded, because a run that only
 node's logs, that message is usually the whole diagnosis.
 
 A retry count in the thousands means requests are being rejected or dropped. On a
-public endpoint that is throttling. On your own node, look for `UND_ERR_SOCKET`
-or `ECONNRESET` (the node is dropping connections — try `--concurrency 16`),
-`HTTP 404` (it does not have that history: still syncing, or pruned), or
-`TimeoutError` (requests wedging).
+public endpoint that is throttling. On your own node, look for `HTTP 500`
+or `UND_ERR_SOCKET` (it is buckling under load), `HTTP 404` (it does not have
+that history: still syncing, or pruned), or `TimeoutError` (requests wedging).
+
+**A local node is not automatically a fast one.** A mempool/Express backend is a
+single Node process in front of electrs; push enough parallel requests at it and
+it starts returning `{"error":"Failed to get transaction"}` for transactions it
+served correctly a second earlier. Against a node that fails above 8 in-flight
+requests, the difference is total:
+
+| `--concurrency` | coverage | retries | failed |
+|---|---|---|---|
+| 64 | **<0.1%** | 1,133 | 47 |
+| 8 | **99.6%** | 0 | 0 |
+
+So concurrency is a *ceiling*, not a setting: the crawl halves it on a round
+where more than 10% of requests error and eases back up on a clean one (AIMD, as
+TCP does it). Starting from a ceiling of 64 against that same node it settles on
+8 by itself and reaches 99.6%. When that happens the report says so:
+
+```
+  backoff  concurrency 64 → 8 — the node errored under load, so the crawl slowed itself down
+           start lower with --concurrency 8 to skip the failed rounds
+```
 
 `TimeoutError` is worth understanding, because the engine only checks its round
 budget *between* batches: one request that never answers holds up its whole batch

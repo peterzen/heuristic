@@ -79,7 +79,9 @@ HEURISTIC — full ancestry taint trace (runs to 100% coverage, no clicking)
 Options
   --api <url>          Esplora REST base. Default: $ESPLORA_API_BASE, else
                        http://127.0.0.1:3006/api (a local electrs/esplora).
-  --concurrency <n>    Parallel tx fetches. Default 64 local, 8 remote.
+  --concurrency <n>    Ceiling on parallel tx fetches. Default 16 local, 8
+                       remote. Backs off automatically when the node starts
+                       erroring, and recovers toward the ceiling when it stops.
   --round <sec>        Work budget per resume step. Default 10. Lower = more
                        frequent checkpoints and a snappier Ctrl-C.
   --request-timeout <sec>
@@ -240,7 +242,8 @@ try {
   die(`--api is not a valid URL: ${API}`);
 }
 const isLocal = PRIVATE_HOST.test(host);
-const concurrency = opts.concurrency ?? (isLocal ? 64 : 8);
+const concurrency = opts.concurrency ?? (isLocal ? 16 : 8);
+const MIN_CONCURRENCY = 2;
 // A local node answers in milliseconds, so a request still outstanding after ten
 // seconds is wedged, not slow. Remote gets more rope for genuine latency.
 const requestTimeoutMs = (opts.requestTimeout ?? (isLocal ? 10 : 30)) * 1000;
@@ -451,6 +454,8 @@ const startedAt = Date.now();
 let result;
 let rounds = 0;
 let stopReason = "complete";
+let throttled = false;
+let concurrencyFloor = Infinity;
 
 // A labelled sender's own label IS the provenance answer — crawling an
 // exchange's internal ancestry is both enormous and meaningless. Same rule the
@@ -495,6 +500,10 @@ if (selfLabel && !opts.deep && !resumeState) {
   };
 
   let state = resumeState;
+  // Concurrency is a ceiling, not a setting. A node that starts erroring under
+  // load is telling us to slow down; hammering it just converts its whole
+  // ancestry into "unresolved" and buries the answer.
+  let active = concurrency;
   let lastVisited = resumeState?.visitedCount ?? 0;
   let lastFrontierSum = NaN;
   let stalls = 0;
@@ -505,11 +514,13 @@ if (selfLabel && !opts.deep && !resumeState) {
     const remainingMs = opts.timeout * 1000 - (Date.now() - startedAt);
     if (remainingMs <= 0) { stopReason = "timeout"; break; }
 
+    const beforeFetches = stats.fetches;
+    const beforeErrors = stats.retries + stats.failures;
     result = await traceTaint(
       seedTxid,
       fetchTx,
       {
-        concurrency,
+        concurrency: active,
       requestTimeoutMs,
         minFraction: opts.minFraction,
         maxNodesPerCall: Math.min(remainingNodes, 2000),
@@ -520,6 +531,22 @@ if (selfLabel && !opts.deep && !resumeState) {
     );
     rounds += 1;
     state = result.state;
+
+    // Halve on a bad round, ease back up on a clean one (AIMD, as TCP does it):
+    // quick to retreat because errors cost coverage, slow to advance because a
+    // struggling node needs room to recover.
+    const reqs = stats.fetches - beforeFetches;
+    const errs = stats.retries + stats.failures - beforeErrors;
+    if (reqs > 0) {
+      const errorRate = errs / reqs;
+      if (errorRate > 0.1 && active > MIN_CONCURRENCY) {
+        active = Math.max(MIN_CONCURRENCY, Math.floor(active / 2));
+        concurrencyFloor = Math.min(concurrencyFloor, active);
+        throttled = true;
+      } else if (errorRate === 0 && active < concurrency) {
+        active = Math.min(concurrency, Math.ceil(active * 1.5));
+      }
+    }
     paint(result.nodesVisited, Math.round(result.coverage * 100), result.frontierSize);
 
     if (opts.saveState) {
@@ -667,6 +694,12 @@ if (opts.json !== "-") {
   // endpoint, and it is worth showing even when every request eventually landed.
   if (stats.retries > 0)
     log(`  ${c.dim("retried")}  ${n(stats.retries)} attempts · ${c.dim(breakdown(retryReasons))}`);
+  if (throttled)
+    log(
+      `  ${c.warn("backoff")}  concurrency ${concurrency} → ${concurrencyFloor} — ` +
+        `the node errored under load, so the crawl slowed itself down\n` +
+        `           ${c.dim(`start lower with --concurrency ${Math.max(2, concurrencyFloor)} to skip the failed rounds`)}`
+    );
   log(
     `  ${c.dim("fetches")}  ${n(stats.fetches)} requests · ${n(stats.hits)} cache hits · ` +
       `${n(stats.retries)} retries · ${n(stats.failures)} failed`
@@ -696,6 +729,8 @@ if (opts.json) {
       stopReason,
       minFraction: opts.minFraction,
       concurrency,
+      concurrencyFloor: throttled ? concurrencyFloor : concurrency,
+      throttled,
       requestTimeoutMs,
       frontierValue,
       frontierTips,
