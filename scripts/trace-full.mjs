@@ -276,6 +276,8 @@ function causeOf(e) {
 // a long run is nothing, and it survives a Ctrl-C that a buffered stream loses.
 function noteAttempt(entry) {
   tally(entry.willRetry ? retryReasons : failureReasons, entry.reason);
+  if (entry.body && !sampleBodies.has(entry.reason))
+    sampleBodies.set(entry.reason, entry.body);
   if (!opts.logFailures) return;
   try {
     appendFileSync(
@@ -307,6 +309,13 @@ async function getJson(path, tries = 3) {
     }
     if (res.ok) return res.json();
     const reason = `HTTP ${res.status} ${res.statusText}`.trim();
+    // An upstream error almost always explains itself in the body (electrs and
+    // the mempool backend both do). Throwing it away leaves a bare status code
+    // and nothing to debug, so keep a bounded slice of it for the log.
+    const body = (await res.text().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 300);
     // A missing or malformed tx will never appear on a retry; only transient
     // conditions (429 / 5xx / a node still syncing) are worth waiting on.
     const permanent = res.status === 400 || res.status === 404;
@@ -317,16 +326,19 @@ async function getJson(path, tries = 3) {
       attempt: attempt + 1,
       status: res.status,
       reason,
+      body: body || null,
       retryAfterSec: retryAfter > 0 ? retryAfter : null,
       willRetry,
     });
-    if (!willRetry) throw new Error(`${reason} — ${path}`);
+    if (!willRetry) throw new Error(`${reason} — ${path}${body ? ` — ${body}` : ""}`);
     stats.retries += 1;
     await sleep(retryAfter > 0 ? retryAfter * 1000 : 250 * 2 ** attempt);
   }
 }
 
 /** "429 Too Many Requests × 612 · ECONNRESET × 51" — the cause, at a glance. */
+const sampleBodies = new Map(); // reason -> first upstream message seen
+
 function breakdown(map, limit = 5) {
   const rows = [...map.entries()].sort((a, b) => b[1] - a[1]);
   const shown = rows.slice(0, limit).map(([reason, count]) => `${reason} × ${n(count)}`);
@@ -633,12 +645,23 @@ if (opts.json !== "-") {
           ? c.dim(` — continue with --resume ${opts.saveState}`)
           : c.dim(" — re-run with --save-state to make a stop resumable"))
     );
-  if (stats.failures > 0) {
-    log(
-      `  ${c.warn("gaps")}     ${plural(stats.failures, "tx fetch", "tx fetches")} failed ` +
-        `— that value is counted as unresolved, not as clean`
-    );
-    log(`           ${c.dim(breakdown(failureReasons))}`);
+  if (stats.failures > 0 || stats.retries > 0) {
+    if (stats.failures > 0)
+      log(
+        `  ${c.warn("gaps")}     ${plural(stats.failures, "tx fetch", "tx fetches")} failed ` +
+          `— that value is counted as unresolved, not as clean\n` +
+          `           ${c.dim(breakdown(failureReasons))}`
+      );
+  }
+  // The upstream's own words, once per distinct cause. On a 500 with nothing in
+  // the node's logs this is usually the entire diagnosis.
+  const said = [...sampleBodies.entries()].filter(
+    ([reason]) => failureReasons.has(reason) || retryReasons.has(reason)
+  );
+  if (said.length > 0) {
+    log(`  ${c.dim("upstream")} ${c.dim("said:")}`);
+    for (const [reason, body] of said.slice(0, 4))
+      log(`           ${c.dim(`${reason} → ${body.slice(0, 120)}`)}`);
   }
   // Heavy retrying is the leading indicator of a throttled or struggling
   // endpoint, and it is worth showing even when every request eventually landed.

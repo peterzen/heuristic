@@ -137,9 +137,17 @@ the cause named:
 
 ```
   gaps     677 tx fetches failed — that value is counted as unresolved, not as clean
-           HTTP 429 Too Many Requests × 612 · UND_ERR_SOCKET × 51 · HTTP 404 Not Found × 14
-  retried  2,482 attempts · HTTP 429 Too Many Requests × 2,301 · UND_ERR_SOCKET × 181
+           HTTP 500 Internal Server Error × 612 · UND_ERR_SOCKET × 51 · HTTP 404 × 14
+  upstream said:
+           HTTP 500 Internal Server Error → {"error":"Bitcoind RPC error: No such
+           mempool or blockchain transaction. Use -txindex or provide a block hash."}
+  retried  2,482 attempts · HTTP 500 Internal Server Error × 2,301
 ```
+
+`upstream said` is the endpoint's own error body, one sample per distinct cause.
+It shows even when every request eventually succeeded, because a run that only
+*retried* heavily leaves no other trace — and on a 500 with nothing in your
+node's logs, that message is usually the whole diagnosis.
 
 A retry count in the thousands means requests are being rejected or dropped. On a
 public endpoint that is throttling. On your own node, look for `UND_ERR_SOCKET`
