@@ -115,6 +115,7 @@ npm run trace -- --resume run.json                  # …and pick it back up
 | `--max-nodes` / `--timeout` | Off-ramps. Combine with `--save-state` so a stop is resumable. |
 | `--deep` | Trace a labelled sender's own ancestry too (by default, as in the UI, a known entity's label *is* the origin). |
 | `--json <file>` | The full result — origins, fractions, score, band, graph — as JSON. `-` writes to stdout. |
+| `--log-failures <f>` | Every failed *and* retried request as JSONL, one object per attempt. |
 
 Exit code `0` means the trace completed and the result is usable, `2` means it is
 incomplete — it stopped on a budget (resumable via `--save-state`/`--resume`), or
@@ -127,6 +128,31 @@ spread across thousands of small branches, each still a round-trip. The queued
 count next to it is the honest measure of what's left. The ancestor-tx counter
 tracks *distinct* transactions, so it can also sit still while the crawl
 re-expands ancestors it has already seen — neither is a stall.
+
+### When coverage comes back low
+
+Low coverage is almost always the endpoint, not the ancestry. Every run ends with
+the cause named:
+
+```
+  gaps     677 tx fetches failed — that value is counted as unresolved, not as clean
+           HTTP 429 Too Many Requests × 612 · UND_ERR_SOCKET × 51 · HTTP 404 Not Found × 14
+  retried  2,482 attempts · HTTP 429 Too Many Requests × 2,301 · UND_ERR_SOCKET × 181
+```
+
+A retry count in the thousands means you are being throttled — that is the public
+API, not your node. `--log-failures <file>` writes every attempt as JSONL for
+digging further:
+
+```bash
+npm run trace -- <addr> --log-failures failures.jsonl
+jq -r .reason failures.jsonl | sort | uniq -c | sort -rn     # what failed
+jq -r 'select(.willRetry==false).path' failures.jsonl        # what was given up on
+```
+
+Each line carries `ts`, `path`, `attempt`, `status`, `reason`, `retryAfterSec`
+and `willRetry`, so a request that failed twice and then succeeded is
+distinguishable from one that was abandoned. The file is truncated per run.
 
 Pointed at a public endpoint it warns you and throttles itself; it is built for
 your own node.

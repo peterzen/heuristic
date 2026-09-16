@@ -16,7 +16,7 @@
  */
 
 import * as nodeModule from "node:module";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, resolve as resolvePath } from "node:path";
 
@@ -92,6 +92,9 @@ Options
   --deep               Trace a labelled sender's own ancestry too. By default a
                        known entity's label IS the answer (as in the UI).
   --json <file>        Write the full result as JSON. "-" writes to stdout.
+  --log-failures <f>   Write every failed and retried request to <f> as JSONL
+                       (one object per attempt: path, attempt, status, reason,
+                       retry-after, whether it was retried). Truncated per run.
   --save-state <file>  Checkpoint the resumable state every round, and on Ctrl-C.
   --resume <file>      Continue a trace from a --save-state file.
   --quiet              No live progress line.
@@ -112,6 +115,7 @@ function parseArgs(argv) {
     minFraction: 1e-5,
     deep: false,
     json: null,
+    logFailures: null,
     saveState: null,
     resume: null,
     quiet: false,
@@ -138,6 +142,7 @@ function parseArgs(argv) {
       case "--min-fraction": o.minFraction = num(next(), "min-fraction"); break;
       case "--deep": o.deep = true; break;
       case "--json": o.json = next(); break;
+      case "--log-failures": o.logFailures = next(); break;
       case "--save-state": o.saveState = next(); break;
       case "--resume": o.resume = next(); break;
       case "--quiet": o.quiet = true; break;
@@ -227,11 +232,46 @@ try {
 const isLocal = PRIVATE_HOST.test(host);
 const concurrency = opts.concurrency ?? (isLocal ? 64 : 8);
 
+if (opts.logFailures) {
+  try {
+    writeFileSync(opts.logFailures, "");
+  } catch (e) {
+    die(`could not open ${opts.logFailures} for writing: ${e.message}`);
+  }
+}
+
 const stats = { fetches: 0, hits: 0, retries: 0, failures: 0 };
+// Why requests failed, so a run that resolves 1.5% of the value can say whether
+// it was rate-limited, refused, or never reached the node at all. Counted apart
+// because a retried attempt that then succeeds still diagnoses the endpoint.
+const failureReasons = new Map();
+const retryReasons = new Map();
 const txCache = new Map();
 const CACHE_MAX = 20_000; // bounded: a deep trace can touch 100k+ txs
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const tally = (map, reason) => map.set(reason, (map.get(reason) ?? 0) + 1);
+
+/** Node's fetch wraps the real cause; the code is what identifies the fault. */
+function causeOf(e) {
+  return e?.cause?.code ?? e?.code ?? e?.cause?.message ?? e?.message ?? "unknown";
+}
+
+// Written with appendFileSync rather than a stream: a few thousand failures over
+// a long run is nothing, and it survives a Ctrl-C that a buffered stream loses.
+function noteAttempt(entry) {
+  tally(entry.willRetry ? retryReasons : failureReasons, entry.reason);
+  if (!opts.logFailures) return;
+  try {
+    appendFileSync(
+      opts.logFailures,
+      `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`
+    );
+  } catch {
+    /* a broken log must never take the trace down with it */
+  }
+}
 
 async function getJson(path, tries = 3) {
   for (let attempt = 0; ; attempt++) {
@@ -240,21 +280,42 @@ async function getJson(path, tries = 3) {
       stats.fetches += 1;
       res = await fetch(`${API}/${path}`, { headers: { accept: "application/json" } });
     } catch (e) {
-      if (attempt >= tries) throw e;
+      const reason = causeOf(e);
+      const willRetry = attempt < tries;
+      noteAttempt({ path, attempt: attempt + 1, status: null, reason, willRetry });
+      if (!willRetry) throw e;
       stats.retries += 1;
       await sleep(250 * 2 ** attempt);
       continue;
     }
     if (res.ok) return res.json();
+    const reason = `HTTP ${res.status} ${res.statusText}`.trim();
     // A missing or malformed tx will never appear on a retry; only transient
     // conditions (429 / 5xx / a node still syncing) are worth waiting on.
-    if (res.status === 400 || res.status === 404)
-      throw new Error(`${res.status} ${res.statusText} — ${path}`);
-    if (attempt >= tries) throw new Error(`${res.status} ${res.statusText} — ${path}`);
+    const permanent = res.status === 400 || res.status === 404;
+    const willRetry = !permanent && attempt < tries;
     const retryAfter = Number(res.headers.get("retry-after"));
+    noteAttempt({
+      path,
+      attempt: attempt + 1,
+      status: res.status,
+      reason,
+      retryAfterSec: retryAfter > 0 ? retryAfter : null,
+      willRetry,
+    });
+    if (!willRetry) throw new Error(`${reason} — ${path}`);
     stats.retries += 1;
     await sleep(retryAfter > 0 ? retryAfter * 1000 : 250 * 2 ** attempt);
   }
+}
+
+/** "429 Too Many Requests × 612 · ECONNRESET × 51" — the cause, at a glance. */
+function breakdown(map, limit = 5) {
+  const rows = [...map.entries()].sort((a, b) => b[1] - a[1]);
+  const shown = rows.slice(0, limit).map(([reason, count]) => `${reason} × ${n(count)}`);
+  const rest = rows.slice(limit).reduce((sum, [, count]) => sum + count, 0);
+  if (rest > 0) shown.push(`${n(rest)} other`);
+  return shown.join(" · ");
 }
 
 async function fetchTx(txid) {
@@ -554,11 +615,17 @@ if (opts.json !== "-") {
           ? c.dim(` — continue with --resume ${opts.saveState}`)
           : c.dim(" — re-run with --save-state to make a stop resumable"))
     );
-  if (stats.failures > 0)
+  if (stats.failures > 0) {
     log(
-      `  ${c.warn("gaps")}     ${n(stats.failures)} tx fetch${stats.failures === 1 ? "" : "es"} failed ` +
+      `  ${c.warn("gaps")}     ${plural(stats.failures, "tx fetch", "tx fetches")} failed ` +
         `— that value is counted as unresolved, not as clean`
     );
+    log(`           ${c.dim(breakdown(failureReasons))}`);
+  }
+  // Heavy retrying is the leading indicator of a throttled or struggling
+  // endpoint, and it is worth showing even when every request eventually landed.
+  if (stats.retries > 0)
+    log(`  ${c.dim("retried")}  ${n(stats.retries)} attempts · ${c.dim(breakdown(retryReasons))}`);
   log(
     `  ${c.dim("fetches")}  ${n(stats.fetches)} requests · ${n(stats.hits)} cache hits · ` +
       `${n(stats.retries)} retries · ${n(stats.failures)} failed`
@@ -596,11 +663,15 @@ if (opts.json) {
         cacheHits: stats.hits,
         retries: stats.retries,
         failures: stats.failures,
+        failureReasons: Object.fromEntries(failureReasons),
+        retryReasons: Object.fromEntries(retryReasons),
       },
     },
   };
   delete payload.state;
   const json = JSON.stringify(payload, null, 2);
+  if (opts.logFailures)
+    log(`  ${c.dim("wrote")} ${opts.logFailures} ${c.dim("(failed + retried requests)")}`);
   if (opts.json === "-") process.stdout.write(`${json}\n`);
   else {
     writeFileSync(opts.json, `${json}\n`);
