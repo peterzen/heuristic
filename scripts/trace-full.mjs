@@ -97,7 +97,8 @@ Options
   --quiet              No live progress line.
   -h, --help           This text.
 
-Exit codes: 0 complete · 2 stopped on a budget (resumable) · 1 error.
+Exit codes: 0 complete and usable · 1 error · 2 incomplete — stopped on a
+budget, or too little of the value resolved to rely on the result.
 `;
 
 function parseArgs(argv) {
@@ -384,20 +385,28 @@ if (selfLabel && !opts.deep && !resumeState) {
   process.on("SIGINT", onSigint);
 
   let lastPaint = 0;
+  let lastQueued = null;
   const paint = (visited, coverage, queued) => {
+    if (queued !== null) lastQueued = queued;
     if (opts.quiet || !process.stderr.isTTY) return;
     const now = Date.now();
     if (now - lastPaint < 100) return;
     lastPaint = now;
     progressLive = true;
+    // The engine's percentage is rounded, so it reads 100% from 99.5% up. Only
+    // the final report may say 100%; while the frontier still has tips, the
+    // long tail is real work and the line must not claim the trace is over.
+    const shown = coverage >= 100 ? ">99" : String(coverage);
+    const left = queued ?? lastQueued;
     process.stderr.write(
-      `\r  ${c.accent("⟳")} ${plural(visited, "ancestor tx", "ancestor txs")} · ${coverage}% of value resolved` +
-        `${queued === null ? "" : ` · ${n(queued)} queued`} · ${elapsed(now - startedAt)}   `
+      `\r  ${c.accent("⟳")} ${plural(visited, "ancestor tx", "ancestor txs")} · ${shown}% of value resolved` +
+        `${left ? ` · ${n(left)} queued` : ""} · ${elapsed(now - startedAt)}   `
     );
   };
 
   let state = resumeState;
   let lastVisited = resumeState?.visitedCount ?? 0;
+  let lastFrontierSum = NaN;
   let stalls = 0;
 
   for (;;) {
@@ -434,13 +443,19 @@ if (selfLabel && !opts.deep && !resumeState) {
     if (result.done) break;
     if (stop) { stopReason = "interrupted"; break; }
 
-    // The engine always drains or expands the frontier, so zero progress twice
-    // running means something outside it is wrong (node down, budget too small
-    // to fetch even one tx). Bail instead of spinning forever.
-    if (result.nodesVisited === lastVisited) {
+    // Zero progress twice running means something outside the engine is wrong
+    // (node down, budget too small to fetch even one tx). Both signals have to
+    // be still: re-expanding an already-visited ancestor is real work that
+    // never moves nodesVisited, and it is most of the long tail.
+    const frontierSum = result.state.frontier.reduce((sum, [, v]) => sum + v, 0);
+    if (
+      result.nodesVisited === lastVisited &&
+      Math.abs(frontierSum - lastFrontierSum) < 1e-12
+    ) {
       if (++stalls >= 2) { stopReason = "stalled"; break; }
     } else stalls = 0;
     lastVisited = result.nodesVisited;
+    lastFrontierSum = frontierSum;
   }
   process.off("SIGINT", onSigint);
 }
@@ -457,9 +472,14 @@ const took = Date.now() - startedAt;
 const frontierValue = (result.state.frontier ?? []).reduce((sum, [, v]) => sum + v, 0);
 const frontierTips = (result.state.frontier ?? []).length;
 
+const unverified = result.coverage < 0.8 && result.score < 25;
+
 const STOP_TEXT = {
   complete: () =>
-    frontierValue > 0
+    stats.failures > 0
+      ? `${c.warn("INCOMPLETE")} — the crawl finished, but ${plural(stats.failures, "fetch", "fetches")} ` +
+        `failed;\n${" ".repeat(11)}those paths were never resolved`
+      : frontierValue > 0
       ? `${c.good("COMPLETE")} — every path followed down to the dust floor`
       : `${c.good("COMPLETE")} — every funding path resolved to an origin`,
   "labelled-sender": () =>
@@ -496,8 +516,18 @@ if (opts.json !== "-") {
       `    ${c.dim(`+ ${plural(hidden, "origin")} under 0.01% (${pct(hiddenValue, 3)} of value)`)}`
     );
   log();
-  log(`  ${c.bold("score")} ${band(`${Math.round(result.score)} / 100`)}   ` +
-      `${c.bold("band")} ${band(result.band.toUpperCase())}`);
+  log(
+    `  ${c.bold("score")} ${band(`${Math.round(result.score)} / 100`)}   ` +
+      `${c.bold("band")} ${band(result.band.toUpperCase())}` +
+      (unverified ? `   ${c.warn("— UNVERIFIED")}` : "")
+  );
+  // Without this line a dead node reads as a clean coin.
+  if (unverified)
+    log(
+      `  ${c.warn("⚠")}        no hack, sanctions or mixing in the ${plural(result.nodesVisited, "ancestor tx", "ancestor txs")} traced,\n` +
+        `           but only ${pct(result.coverage)} of the value resolved — this is "nothing found",\n` +
+        `           not "nothing there". Do not read it as clean.`
+    );
   log(
     `  ${c.dim("flagged")} ${pct(result.badFraction)}  ` +
       `${c.dim("mixed")} ${pct(result.mixedFraction)}  ` +
@@ -560,6 +590,7 @@ if (opts.json) {
       concurrency,
       frontierValue,
       frontierTips,
+      unverified,
       requests: {
         total: stats.fetches,
         cacheHits: stats.hits,
@@ -577,4 +608,4 @@ if (opts.json) {
   }
 }
 
-process.exit(result.done ? 0 : 2);
+process.exit(result.done && !unverified ? 0 : 2);

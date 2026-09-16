@@ -116,9 +116,20 @@ npm run trace -- --resume run.json                  # …and pick it back up
 | `--deep` | Trace a labelled sender's own ancestry too (by default, as in the UI, a known entity's label *is* the origin). |
 | `--json <file>` | The full result — origins, fractions, score, band, graph — as JSON. `-` writes to stdout. |
 
-Exit code `0` means the trace completed, `2` means it stopped on a budget and is
-resumable. Pointed at a public endpoint it warns you and throttles itself; it is
-built for your own node.
+Exit code `0` means the trace completed and the result is usable, `2` means it is
+incomplete — it stopped on a budget (resumable via `--save-state`/`--resume`), or
+too little of the value resolved to rely on. A low score on a thin trace is
+reported as `UNVERIFIED`: "nothing found" is not "nothing there".
+
+Expect the **long tail** to dominate the runtime. The progress line reaches
+`>99%` early and then grinds for a long time: the last fraction of a percent is
+spread across thousands of small branches, each still a round-trip. The queued
+count next to it is the honest measure of what's left. The ancestor-tx counter
+tracks *distinct* transactions, so it can also sit still while the crawl
+re-expands ancestors it has already seen — neither is a stall.
+
+Pointed at a public endpoint it warns you and throttles itself; it is built for
+your own node.
 
 ---
 
