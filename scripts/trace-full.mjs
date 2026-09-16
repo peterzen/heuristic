@@ -82,6 +82,12 @@ Options
   --concurrency <n>    Parallel tx fetches. Default 64 local, 8 remote.
   --round <sec>        Work budget per resume step. Default 10. Lower = more
                        frequent checkpoints and a snappier Ctrl-C.
+  --request-timeout <sec>
+                       Give up on a single request after this long. Default 10
+                       local, 30 remote.
+                       The engine only checks its round budget between batches,
+                       so one hung request holds up a whole batch of
+                       --concurrency fetches; this bounds that.
   --max-nodes <n>      Stop after about this many ancestor txs (a round always
                        finishes its current batch of --concurrency fetches, so
                        the real total can overshoot by up to that much).
@@ -110,6 +116,7 @@ function parseArgs(argv) {
     api: null,
     concurrency: null,
     round: 10,
+    requestTimeout: null,
     maxNodes: Infinity,
     timeout: Infinity,
     minFraction: 1e-5,
@@ -137,6 +144,9 @@ function parseArgs(argv) {
       case "--api": o.api = next(); break;
       case "--concurrency": o.concurrency = num(next(), "concurrency"); break;
       case "--round": o.round = num(next(), "round"); break;
+      case "--request-timeout":
+        o.requestTimeout = num(next(), "request-timeout");
+        break;
       case "--max-nodes": o.maxNodes = num(next(), "max-nodes"); break;
       case "--timeout": o.timeout = num(next(), "timeout"); break;
       case "--min-fraction": o.minFraction = num(next(), "min-fraction"); break;
@@ -231,6 +241,9 @@ try {
 }
 const isLocal = PRIVATE_HOST.test(host);
 const concurrency = opts.concurrency ?? (isLocal ? 64 : 8);
+// A local node answers in milliseconds, so a request still outstanding after ten
+// seconds is wedged, not slow. Remote gets more rope for genuine latency.
+const requestTimeoutMs = (opts.requestTimeout ?? (isLocal ? 10 : 30)) * 1000;
 
 if (opts.logFailures) {
   try {
@@ -255,6 +268,7 @@ const tally = (map, reason) => map.set(reason, (map.get(reason) ?? 0) + 1);
 
 /** Node's fetch wraps the real cause; the code is what identifies the fault. */
 function causeOf(e) {
+  if (e?.name === "TimeoutError") return "TimeoutError (--request-timeout)";
   return e?.cause?.code ?? e?.code ?? e?.cause?.message ?? e?.message ?? "unknown";
 }
 
@@ -278,7 +292,10 @@ async function getJson(path, tries = 3) {
     let res;
     try {
       stats.fetches += 1;
-      res = await fetch(`${API}/${path}`, { headers: { accept: "application/json" } });
+      res = await fetch(`${API}/${path}`, {
+        headers: { accept: "application/json" },
+        signal: AbortSignal.timeout(requestTimeoutMs),
+      });
     } catch (e) {
       const reason = causeOf(e);
       const willRetry = attempt < tries;
@@ -481,6 +498,7 @@ if (selfLabel && !opts.deep && !resumeState) {
       fetchTx,
       {
         concurrency,
+      requestTimeoutMs,
         minFraction: opts.minFraction,
         maxNodesPerCall: Math.min(remainingNodes, 2000),
         timeBudgetMs: Math.min(remainingMs, opts.round * 1000),
@@ -655,6 +673,7 @@ if (opts.json) {
       stopReason,
       minFraction: opts.minFraction,
       concurrency,
+      requestTimeoutMs,
       frontierValue,
       frontierTips,
       unverified,

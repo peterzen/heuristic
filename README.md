@@ -116,6 +116,7 @@ npm run trace -- --resume run.json                  # …and pick it back up
 | `--deep` | Trace a labelled sender's own ancestry too (by default, as in the UI, a known entity's label *is* the origin). |
 | `--json <file>` | The full result — origins, fractions, score, band, graph — as JSON. `-` writes to stdout. |
 | `--log-failures <f>` | Every failed *and* retried request as JSONL, one object per attempt. |
+| `--request-timeout <sec>` | Give up on one request after this long. Default 10 local, 30 remote. |
 
 Exit code `0` means the trace completed and the result is usable, `2` means it is
 incomplete — it stopped on a budget (resumable via `--save-state`/`--resume`), or
@@ -140,8 +141,17 @@ the cause named:
   retried  2,482 attempts · HTTP 429 Too Many Requests × 2,301 · UND_ERR_SOCKET × 181
 ```
 
-A retry count in the thousands means you are being throttled — that is the public
-API, not your node. `--log-failures <file>` writes every attempt as JSONL for
+A retry count in the thousands means requests are being rejected or dropped. On a
+public endpoint that is throttling. On your own node, look for `UND_ERR_SOCKET`
+or `ECONNRESET` (the node is dropping connections — try `--concurrency 16`),
+`HTTP 404` (it does not have that history: still syncing, or pruned), or
+`TimeoutError` (requests wedging).
+
+`TimeoutError` is worth understanding, because the engine only checks its round
+budget *between* batches: one request that never answers holds up its whole batch
+of `--concurrency` fetches, and a 10-second round can run for minutes. If your
+rounds are taking far longer than `--round`, that is what is happening, and a
+tighter `--request-timeout` is the fix. `--log-failures <file>` writes every attempt as JSONL for
 digging further:
 
 ```bash
